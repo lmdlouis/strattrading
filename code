@@ -1,0 +1,85 @@
+//@version=6
+strategy("Fib Pullback - Hybrid JYA", overlay=true, initial_capital=100000, max_bars_back=5000, margin_long=10, margin_short=10, calc_on_every_tick=true)
+
+// --- 1. Parameters ---
+swingLen     = input.int(32, title="Swing High/Low Lookback")
+macroLen     = input.int(50, title="Macro SMA Trend Filter")
+adxThreshold = input.int(15, title="ADX Threshold")
+riskDollars  = input.float(1000.0, title="Risk Per Trade ($)")
+rrRatio      = input.float(3.0, title="Target R/R") 
+fibInput     = input.float(0.618, title="Fib Level")
+customPV     = input.float(12500000, title="Custom Point Value")
+
+// --- 2. Logic ---
+macroSMA   = ta.sma(close, macroLen)
+swingHigh  = ta.highest(high, swingLen)
+swingLow   = ta.lowest(low, swingLen)
+[_, _, adx] = ta.dmi(14, 14)
+
+fibLongEntry  = math.round((swingHigh - ((swingHigh - swingLow) * fibInput)) / syminfo.mintick) * syminfo.mintick
+fibShortEntry = math.round((swingLow + ((swingHigh - swingLow) * fibInput)) / syminfo.mintick) * syminfo.mintick
+
+// --- 2.5 Visuals ---
+plot(macroSMA, color=color.white, linewidth=2, title="Macro Trend")
+plot(fibLongEntry, color=color.green, style=plot.style_circles, title="Long Fib Entry")
+plot(fibShortEntry, color=color.red, style=plot.style_circles, title="Short Fib Entry")
+
+// --- 3. Position Sizing ---
+estRiskLong  = math.max(syminfo.mintick, fibLongEntry - swingLow)
+estRiskShort = math.max(syminfo.mintick, swingHigh - fibShortEntry)
+qtyLong      = math.max(1, math.floor(riskDollars / (estRiskLong * customPV)))
+qtyShort     = math.max(1, math.floor(riskDollars / (estRiskShort * customPV)))
+
+// --- Variables to lock in the exact stop loss level ---
+var float lockedStop = na
+
+// --- 4. Execution & Immediate Bracket ---
+// CRITICAL FIX: Added barstate.isconfirmed to prevent intrabar alert spam
+longCondition  = (close > macroSMA) and adx > adxThreshold and ta.crossunder(low, fibLongEntry) and barstate.isconfirmed
+shortCondition = (close < macroSMA) and adx > adxThreshold and ta.crossover(high, fibShortEntry) and barstate.isconfirmed
+
+if (longCondition and strategy.position_size == 0)
+    lockedStop := swingLow
+    float estimatedTPLong = fibLongEntry + (estRiskLong * rrRatio)
+    
+    // Build the custom email string for Longs
+    string longMsg = "ACTION: BUY\n" +
+                     "TYPE: Limit Order\n" +
+                     "CONTRACTS: " + str.tostring(qtyLong) + "\n" +
+                     "ENTRY PRICE: " + str.tostring(fibLongEntry) + "\n" +
+                     "STOP LOSS: " + str.tostring(lockedStop) + "\n" +
+                     "TAKE PROFIT: " + str.tostring(estimatedTPLong)
+
+    strategy.entry("Long", strategy.long, qty=qtyLong, alert_message=longMsg)
+    // CRITICAL FIX: Silenced the exit order so it doesn't send blank alerts
+    strategy.exit("Exit Long", "Long", stop=lockedStop, limit=estimatedTPLong, alert_message="")
+
+if (shortCondition and strategy.position_size == 0)
+    lockedStop := swingHigh
+    float estimatedTPShort = fibShortEntry - (estRiskShort * rrRatio)
+    
+    // Build the custom email string for Shorts
+    string shortMsg = "ACTION: SELL\n" +
+                      "TYPE: Limit Order\n" +
+                      "CONTRACTS: " + str.tostring(qtyShort) + "\n" +
+                      "ENTRY PRICE: " + str.tostring(fibShortEntry) + "\n" +
+                      "STOP LOSS: " + str.tostring(lockedStop) + "\n" +
+                      "TAKE PROFIT: " + str.tostring(estimatedTPShort)
+
+    strategy.entry("Short", strategy.short, qty=qtyShort, alert_message=shortMsg)
+    // CRITICAL FIX: Silenced the exit order so it doesn't send blank alerts
+    strategy.exit("Exit Short", "Short", stop=lockedStop, limit=estimatedTPShort, alert_message="")
+
+// --- 5. Dynamic Take-Profit Update (Recalculates on exact fill) ---
+if (strategy.position_size > 0)
+    float actualRiskLong = strategy.position_avg_price - lockedStop
+    float actualTargetLong = strategy.position_avg_price + (actualRiskLong * rrRatio)
+    // CRITICAL FIX: Silenced the dynamic update to prevent alert spam
+    strategy.exit("Exit Long", "Long", stop=lockedStop, limit=actualTargetLong, alert_message="")
+
+if (strategy.position_size < 0)
+    float actualRiskShort = lockedStop - strategy.position_avg_price
+
+    float actualTargetShort = strategy.position_avg_price - (actualRiskShort * rrRatio)
+    // CRITICAL FIX: Silenced the dynamic update to prevent alert spam
+    strategy.exit("Exit Short", "Short", stop=lockedStop, limit=actualTargetShort, alert_message="")
